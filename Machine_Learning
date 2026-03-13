@@ -1,0 +1,20 @@
+For binary classification (depressed / not)
+XGBoost or LightGBM would be my top pick — they handle mixed data types, missing values, and class imbalance really well, which is exactly what you'll have after merging 4 datasets from different sources. Fast to train too.
+Random Forest is a solid baseline and gives you feature importance for free, which is super useful here to understand which questions matter most — important for when you build the interface later.
+Logistic Regression is worth including as a sanity baseline. If your fancy models don't beat it significantly, something's wrong with your features.
+
+For severity prediction (0→4 scale)
+This is an ordinal regression problem — the classes have an order (mild < moderate < severe), so standard multiclass classification ignores that structure. Two good approaches:
+XGBoost with ordinal objective handles this natively. Alternatively you can treat it as plain multiclass and it still works decently.
+Ordinal Logistic Regression (mord library in Python) is the statistically clean choice if you want to respect the ordinal nature properly.
+
+My suggested approach for your project:
+Since you're at ESME in AI majeur, I'd go with this stack:
+
+Random Forest as baseline (interpretable, explainable)
+XGBoost as your main model (best performance)
+A simple Neural Network with sklearn or PyTorch as a third comparison point
+
+Then use SHAP values to explain which features drive predictions — this is really powerful for a mental health context and would make your project stand out (herausstechen — to stand out).
+
+One important thing to keep in mind: depression datasets tend to be imbalanced (fewer depressed samples). Make sure to use class_weight='balanced' or SMOTE oversampling, otherwise your model will just predict "not depressed" for everyone and still get 80% accuracy on paper.
