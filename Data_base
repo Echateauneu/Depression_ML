@@ -1,0 +1,425 @@
+"""
+Depression Dataset Pipeline
+============================
+Downloads, cleans, and merges multiple public depression datasets into one
+unified CSV ready for ML training.
+
+Datasets used:
+  1. Kaggle - Depression Student Dataset
+  2. Kaggle - Depression & Anxiety Survey (DASS)
+  3. Kaggle - Mental Health in Tech Survey
+  4. Kaggle - Depression Survey Dataset (symptoms-based)
+
+Since Kaggle requires authentication, this script has TWO modes:
+  - AUTO mode  : downloads via kaggle CLI (if you have ~/.kaggle/kaggle.json)
+  - MANUAL mode: you drop the raw CSVs into ./raw_data/ yourself (instructions below)
+
+Output:
+  ./depression_clean.csv   — unified, cleaned, ML-ready dataset
+
+Dependencies:
+    pip install pandas numpy scikit-learn kaggle
+
+Usage:
+    python depression_pipeline.py
+"""
+
+import os
+import warnings
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import LabelEncoder
+
+warnings.filterwarnings("ignore")
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+RAW_DIR    = "raw_data"
+OUTPUT_CSV = "depression_clean.csv"
+os.makedirs(RAW_DIR, exist_ok=True)
+
+# ─── DATASET REGISTRY ────────────────────────────────────────────────────────
+# Each entry: kaggle slug, expected filename after download, display name
+
+DATASETS = [
+    {
+        "name":     "Student Depression Survey",
+        "slug":     "anthonytherrien/depression-student-dataset",
+        "file":     "depression_student_dataset.csv",
+        "loader":   "load_student",
+    },
+    {
+        "name":     "DASS Depression & Anxiety",
+        "slug":     "lucasgreenwell/depression-anxiety-stress-scales-responses",
+        "file":     "data.csv",
+        "loader":   "load_dass",
+    },
+    {
+        "name":     "Mental Health in Tech",
+        "slug":     "osmi/mental-health-in-tech-survey",
+        "file":     "survey.csv",
+        "loader":   "load_tech",
+    },
+    {
+        "name":     "Depression Symptoms Survey",
+        "slug":     "tinydino001/depression-survey-dataset",
+        "file":     "depression_data.csv",
+        "loader":   "load_symptoms",
+    },
+]
+
+# ─── KAGGLE DOWNLOAD ─────────────────────────────────────────────────────────
+
+def try_kaggle_download(slug: str, dest_dir: str) -> bool:
+    """Attempt to download a dataset via kaggle CLI. Returns True on success."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["kaggle", "datasets", "download", "-d", slug,
+             "--unzip", "-p", dest_dir],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def ensure_raw_files():
+    """Download all datasets if not already present."""
+    print("\n[STEP 1] Checking / downloading raw datasets …\n")
+    missing = []
+
+    for ds in DATASETS:
+        path = os.path.join(RAW_DIR, ds["file"])
+        if os.path.exists(path):
+            print(f"  ✓ {ds['name']} — already present")
+            continue
+
+        print(f"  ↓ {ds['name']} — trying kaggle CLI …")
+        success = try_kaggle_download(ds["slug"], RAW_DIR)
+        if success and os.path.exists(path):
+            print(f"    ✓ Downloaded OK")
+        else:
+            print(f"    ✗ Failed — add manually:")
+            print(f"      Kaggle URL : https://www.kaggle.com/datasets/{ds['slug']}")
+            print(f"      Save as    : {RAW_DIR}/{ds['file']}\n")
+            missing.append(ds["name"])
+
+    if missing:
+        print("─" * 60)
+        print(f"  {len(missing)} dataset(s) need manual download (see above).")
+        print("  Re-run after adding the files.\n")
+        print("  Tip: to set up kaggle CLI automatically, follow:")
+        print("  https://www.kaggle.com/docs/api#authentication")
+        print("─" * 60)
+
+    return missing
+
+
+# ─── SHARED HELPERS ──────────────────────────────────────────────────────────
+
+def normalize_gender(series: pd.Series) -> pd.Series:
+    """Map messy gender strings to M / F / Other."""
+    s = series.astype(str).str.strip().str.lower()
+    mapping = {
+        "male": "M", "m": "M", "man": "M", "boy": "M",
+        "female": "F", "f": "F", "woman": "F", "girl": "F",
+        "non-binary": "Other", "nonbinary": "Other",
+        "other": "Other", "nan": np.nan, "": np.nan,
+    }
+    return s.map(lambda x: mapping.get(x, "Other"))
+
+
+def normalize_age(series: pd.Series,
+                  min_age: int = 10,
+                  max_age: int = 100) -> pd.Series:
+    """Clip ages to a plausible range, coerce non-numeric to NaN."""
+    ages = pd.to_numeric(series, errors="coerce")
+    return ages.where((ages >= min_age) & (ages <= max_age))
+
+
+def binary_depression(series: pd.Series) -> pd.Series:
+    """Coerce various depression labels → 0 (no) / 1 (yes)."""
+    s = series.astype(str).str.strip().str.lower()
+    yes_values = {"yes", "1", "true", "depressed", "depression"}
+    no_values  = {"no",  "0", "false", "not depressed", "none"}
+    return s.map(lambda x: 1 if x in yes_values else (0 if x in no_values else np.nan))
+
+
+def drop_high_null(df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
+    """Drop columns with more than `threshold` fraction of NaNs."""
+    null_frac = df.isnull().mean()
+    keep = null_frac[null_frac <= threshold].index.tolist()
+    dropped = [c for c in df.columns if c not in keep]
+    if dropped:
+        print(f"    Dropped high-null cols: {dropped}")
+    return df[keep]
+
+
+def encode_categoricals(df: pd.DataFrame,
+                         exclude: list = None) -> pd.DataFrame:
+    """Label-encode remaining object columns."""
+    exclude = exclude or []
+    le = LabelEncoder()
+    for col in df.select_dtypes(include="object").columns:
+        if col not in exclude:
+            df[col] = df[col].astype(str)
+            df[col] = le.fit_transform(df[col])
+    return df
+
+
+# ─── DATASET-SPECIFIC LOADERS ────────────────────────────────────────────────
+
+def load_student(path: str) -> pd.DataFrame:
+    """
+    Student Depression Dataset
+    Cols: Age, Gender, Academic Pressure, Study Satisfaction, Sleep Duration,
+          Dietary Habits, Suicidal Thoughts, Study Hours, Financial Stress,
+          Family History, Depression
+    """
+    print("  → Cleaning: Student Depression Survey")
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip()
+
+    out = pd.DataFrame()
+    out["age"]                  = normalize_age(df.get("Age"))
+    out["gender"]               = normalize_gender(df.get("Gender", pd.Series()))
+    out["sleep_hours"]          = pd.to_numeric(df.get("Sleep Duration"), errors="coerce")
+    out["academic_pressure"]    = pd.to_numeric(df.get("Academic Pressure"), errors="coerce")
+    out["study_satisfaction"]   = pd.to_numeric(df.get("Study Satisfaction"), errors="coerce")
+    out["financial_stress"]     = pd.to_numeric(df.get("Financial Stress"), errors="coerce")
+    out["study_hours"]          = pd.to_numeric(df.get("Study Hours"), errors="coerce")
+    out["family_history_mh"]    = df.get("Family History of Mental Illness", pd.Series()).map(
+                                      lambda x: 1 if str(x).lower() in ["yes","1"] else 0)
+    out["suicidal_thoughts"]    = df.get("Have you ever had suicidal thoughts ?", pd.Series()).map(
+                                      lambda x: 1 if str(x).lower() in ["yes","1"] else 0)
+    out["dietary_habits"]       = df.get("Dietary Habits", pd.Series()).astype(str)
+    out["depression_binary"]    = binary_depression(df.get("Depression", pd.Series()))
+    out["depression_severity"]  = np.nan   # not available in this dataset
+    out["source"]               = "student_survey"
+    return out
+
+
+def load_dass(path: str) -> pd.DataFrame:
+    """
+    DASS-42 responses dataset.
+    Cols: Q1A–Q42A (raw DASS items), country, age, gender, ...
+    Depression subscale: items Q3,Q5,Q10,Q13,Q16,Q17,Q21,Q24,Q26,Q31,Q34,Q37,Q38,Q42
+    Score ranges: 0-9 normal, 10-13 mild, 14-20 moderate, 21-27 severe, 28+ extremely severe
+    """
+    print("  → Cleaning: DASS Depression & Anxiety")
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip()
+
+    # DASS depression items (1-indexed in the questionnaire)
+    depression_items = [3,5,10,13,16,17,21,24,26,31,34,37,38,42]
+    dep_cols = [f"Q{i}A" for i in depression_items if f"Q{i}A" in df.columns]
+
+    raw_score = df[dep_cols].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+    # DASS multiplies by 2 for the 21-item version; raw 42-item is direct
+    dep_score = raw_score
+
+    def severity(s):
+        if pd.isna(s):   return np.nan
+        if s <= 9:        return 0   # normal
+        if s <= 13:       return 1   # mild
+        if s <= 20:       return 2   # moderate
+        if s <= 27:       return 3   # severe
+        return 4                     # extremely severe
+
+    out = pd.DataFrame()
+    out["age"]                 = normalize_age(df.get("age"))
+    out["gender"]              = normalize_gender(df.get("gender", pd.Series()))
+    out["depression_score"]    = dep_score
+    out["depression_binary"]   = (dep_score >= 10).astype(float)
+    out["depression_severity"] = dep_score.map(severity)
+    out["source"]              = "dass"
+
+    # Optional extras if present
+    for col, out_col in [("country","country"), ("education","education_level")]:
+        if col in df.columns:
+            out[out_col] = df[col].astype(str)
+
+    return out
+
+
+def load_tech(path: str) -> pd.DataFrame:
+    """
+    Mental Health in Tech Survey (OSMI).
+    Depression label derived from 'treatment' column (sought treatment).
+    """
+    print("  → Cleaning: Mental Health in Tech")
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip()
+
+    out = pd.DataFrame()
+    out["age"]                 = normalize_age(df.get("Age"))
+    out["gender"]              = normalize_gender(df.get("Gender", pd.Series()))
+    out["country"]             = df.get("Country", pd.Series()).astype(str)
+    out["self_employed"]       = df.get("self_employed", pd.Series()).map(
+                                     lambda x: 1 if str(x).lower()=="yes" else 0)
+    out["family_history_mh"]   = df.get("family_history", pd.Series()).map(
+                                     lambda x: 1 if str(x).lower()=="yes" else 0)
+    out["work_interfere"]      = df.get("work_interfere", pd.Series()).astype(str)
+    out["remote_work"]         = df.get("remote_work", pd.Series()).map(
+                                     lambda x: 1 if str(x).lower()=="yes" else 0)
+    out["benefits"]            = df.get("benefits", pd.Series()).astype(str)
+    out["seek_help"]           = df.get("seek_help", pd.Series()).astype(str)
+    out["mental_health_consequence"] = df.get("mental_health_consequence", pd.Series()).astype(str)
+    # 'treatment' = sought treatment for mental health → use as depression proxy
+    out["depression_binary"]   = binary_depression(df.get("treatment", pd.Series()))
+    out["depression_severity"] = np.nan
+    out["source"]              = "tech_survey"
+    return out
+
+
+def load_symptoms(path: str) -> pd.DataFrame:
+    """
+    Depression Symptoms Survey — generic symptom-based dataset.
+    Tries to be flexible with column names.
+    """
+    print("  → Cleaning: Depression Symptoms Survey")
+    df = pd.read_csv(path)
+    df.columns = df.columns.str.strip()
+
+    # Try to auto-detect the depression label column
+    label_col = None
+    for candidate in ["Depression", "depression", "label", "Label",
+                       "depressed", "Depressed", "target", "Target"]:
+        if candidate in df.columns:
+            label_col = candidate
+            break
+
+    out = pd.DataFrame()
+    out["age"]    = normalize_age(df.get("Age", df.get("age", pd.Series())))
+    out["gender"] = normalize_gender(df.get("Gender", df.get("gender", pd.Series())))
+
+    # Grab all remaining numeric cols as symptom features
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    skip = {label_col, "Age", "age"}
+    for col in numeric_cols:
+        if col not in skip:
+            safe = col.lower().replace(" ", "_").replace("-", "_")
+            out[f"symptom_{safe}"] = pd.to_numeric(df[col], errors="coerce")
+
+    out["depression_binary"]   = binary_depression(df[label_col]) if label_col else np.nan
+    out["depression_severity"] = np.nan
+    out["source"]              = "symptoms_survey"
+    return out
+
+
+# ─── MERGE & FINAL CLEANING ──────────────────────────────────────────────────
+
+LOADERS = {
+    "load_student":  load_student,
+    "load_dass":     load_dass,
+    "load_tech":     load_tech,
+    "load_symptoms": load_symptoms,
+}
+
+
+def merge_datasets(loaded: list[pd.DataFrame]) -> pd.DataFrame:
+    """Concatenate all sub-datasets, align columns, fill gaps."""
+    print("\n[STEP 3] Merging datasets …")
+    merged = pd.concat(loaded, ignore_index=True, sort=False)
+    print(f"  Raw merged shape: {merged.shape}")
+    return merged
+
+
+def final_clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Global cleaning pass on the merged dataframe."""
+    print("\n[STEP 4] Final cleaning …")
+
+    # ── Drop mostly-empty columns ──────────────────────────────────────────
+    df = drop_high_null(df, threshold=0.6)
+
+    # ── Gender encoding ───────────────────────────────────────────────────
+    if "gender" in df.columns:
+        df["gender"] = df["gender"].map({"M": 0, "F": 1, "Other": 2})
+
+    # ── Encode remaining string columns ──────────────────────────────────
+    df = encode_categoricals(df, exclude=["source"])
+
+    # ── Drop rows with no label at all ───────────────────────────────────
+    if "depression_binary" in df.columns:
+        before = len(df)
+        df = df.dropna(subset=["depression_binary"])
+        print(f"  Dropped {before - len(df)} rows with missing label.")
+
+    # ── Fill remaining NaNs with column median (numeric only) ─────────────
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    df[num_cols] = df[num_cols].fillna(df[num_cols].median())
+
+    # ── Enforce types ──────────────────────────────────────────────────────
+    if "depression_binary" in df.columns:
+        df["depression_binary"] = df["depression_binary"].astype(int)
+    if "depression_severity" in df.columns:
+        df["depression_severity"] = pd.to_numeric(
+            df["depression_severity"], errors="coerce"
+        ).astype("Int64")  # nullable int (allows NaN)
+
+    # ── Reset index ───────────────────────────────────────────────────────
+    df = df.reset_index(drop=True)
+
+    print(f"  Final shape : {df.shape}")
+    print(f"  Label distribution:")
+    if "depression_binary" in df.columns:
+        vc = df["depression_binary"].value_counts()
+        print(f"    Not depressed (0) : {vc.get(0, 0)}")
+        print(f"    Depressed     (1) : {vc.get(1, 0)}")
+    return df
+
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  Depression Dataset Pipeline")
+    print("=" * 60)
+
+    # Step 1 — download
+    missing = ensure_raw_files()
+
+    # Step 2 — load & clean each dataset
+    print("\n[STEP 2] Loading and cleaning individual datasets …\n")
+    loaded = []
+
+    for ds in DATASETS:
+        path = os.path.join(RAW_DIR, ds["file"])
+        if not os.path.exists(path):
+            print(f"  ⚠ Skipping '{ds['name']}' (file not found)")
+            continue
+        try:
+            fn = LOADERS[ds["loader"]]
+            sub_df = fn(path)
+            print(f"    Shape after cleaning: {sub_df.shape}")
+            loaded.append(sub_df)
+        except Exception as e:
+            print(f"  ✗ Error loading '{ds['name']}': {e}")
+
+    if not loaded:
+        print("\n✗ No datasets loaded. Please add raw files to ./raw_data/ and retry.")
+        return
+
+    # Step 3 — merge
+    merged = merge_datasets(loaded)
+
+    # Step 4 — final clean
+    final = final_clean(merged)
+
+    # Step 5 — save
+    final.to_csv(OUTPUT_CSV, index=False)
+    print(f"\n✓ Saved → {os.path.abspath(OUTPUT_CSV)}")
+    print(f"\nColumn overview:")
+    for col in final.columns:
+        dtype = final[col].dtype
+        nulls = final[col].isna().sum()
+        print(f"  {col:<35} dtype={str(dtype):<10} nulls={nulls}")
+
+    print("\n" + "=" * 60)
+    print("  Done! Your ML-ready dataset is ready.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
