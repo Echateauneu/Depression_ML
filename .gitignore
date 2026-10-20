@@ -1,0 +1,6 @@
+raw_data/
+models/
+__pycache__/
+.pytest_cache/
+.venv/
+*.csv
